@@ -142,12 +142,15 @@ export class StoreReader {
     SelectionSetNode
   >();
 
-  // Tracks which executeSelectionSet cache-key objects were accessed while
-  // computing a specific watch's result, along with the minimal args needed
-  // to call executeSelectionSet.forget() for that entry later.
+  // Tracks which memoized cache-key objects were accessed while computing a
+  // specific watch's result. Each entry stores a callback that, when invoked,
+  // calls forget() on the appropriate wrapped function and removes the
+  // corresponding Trie path. This covers both executeSelectionSet and
+  // executeSubSelectedArray entries under a single map so forgetWatch stays
+  // type-agnostic and new memoized functions can be added without changing it.
   private readonly watchEntries = new WeakMap<
     Cache.WatchOptions<any, any>,
-    Map<object, ExecSelectionSetKeyArgs>
+    Map<object, () => void>
   >();
 
   // Reference counts for shared entries: how many active watches reference
@@ -240,17 +243,30 @@ export class StoreReader {
                 self.watchEntries.set(watch, (entries = new Map()));
               }
               if (!entries.has(key)) {
-                // Only need store + varString for a future forget() call since
-                // that's all makeCacheKey reads from the context argument.
-                entries.set(key, [
-                  selectionSet,
-                  parent,
-                  {
-                    store: context.store,
-                    varString: context.varString,
-                  } as ReadMergeModifyContext,
-                  canonizeResults,
-                ]);
+                // Capture the minimal args needed to forget this entry and
+                // remove its Trie path later. Only store + varString are
+                // needed because that is all makeCacheKey reads from context.
+                const store = context.store;
+                const varString = context.varString;
+                entries.set(key, () => {
+                  self.executeSelectionSet.forget(
+                    selectionSet,
+                    parent,
+                    { store, varString } as ReadMergeModifyContext,
+                    canonizeResults
+                  );
+                  // Remove the Trie routing path so the strong Map entries
+                  // for the entity ref and varString strings are freed
+                  // immediately rather than waiting for LRU eviction.
+                  // No supportsResultCaching guard needed: this callback is
+                  // only ever created inside the supportsResultCaching branch.
+                  store.group.keyMaker.removeArray([
+                    selectionSet,
+                    isReference(parent) ? parent.__ref : parent,
+                    varString,
+                    canonizeResults,
+                  ]);
+                });
                 self.keyRefCounts.set(
                   key,
                   (self.keyRefCounts.get(key) ?? 0) + 1
@@ -278,7 +294,41 @@ export class StoreReader {
           defaultCacheSizes["inMemoryCache.executeSubSelectedArray"],
         makeCacheKey({ field, array, context }) {
           if (supportsResultCaching(context.store)) {
-            return context.store.makeCacheKey(field, array, context.varString);
+            const key = context.store.makeCacheKey(
+              field,
+              array,
+              context.varString
+            );
+
+            if (key !== undefined && self.currentWatch) {
+              const watch = self.currentWatch;
+              let entries = self.watchEntries.get(watch);
+              if (!entries) {
+                self.watchEntries.set(watch, (entries = new Map()));
+              }
+              if (!entries.has(key)) {
+                const store = context.store;
+                const varString = context.varString;
+                entries.set(key, () => {
+                  self.executeSubSelectedArray.forget({
+                    field,
+                    array,
+                    context: { store, varString } as ReadMergeModifyContext,
+                  } as ExecSubSelectedArrayOptions);
+                  // field and array are WeakMap keys in the Trie, so their
+                  // nodes self-collect when GC'd. We still call removeArray
+                  // to eagerly release the varString strong-Map entry inside
+                  // the array-keyed node. No supportsResultCaching guard
+                  // needed: same reasoning as executeSelectionSet above.
+                  store.group.keyMaker.removeArray([field, array, varString]);
+                });
+                self.keyRefCounts.set(
+                  key,
+                  (self.keyRefCounts.get(key) ?? 0) + 1
+                );
+              }
+            }
+            return key;
           }
         },
       }
@@ -286,9 +336,10 @@ export class StoreReader {
   }
 
   /**
-   * Releases all memoized executeSelectionSet entries that were recorded for
-   * the given watch. Entries shared with other active watches are only freed
-   * when the last watch referencing them is removed (reference-counted).
+   * Releases all memoized entries (executeSelectionSet and
+   * executeSubSelectedArray) that were recorded for the given watch. Entries
+   * shared with other active watches are only freed when the last watch
+   * referencing them is removed (reference-counted).
    *
    * Called from InMemoryCache's unwatch function so that memoized result
    * objects don't outlive the component that subscribed to this watch.
@@ -296,32 +347,11 @@ export class StoreReader {
   public forgetWatch(watch: Cache.WatchOptions<any, any>): void {
     const entries = this.watchEntries.get(watch);
     if (!entries) return;
-    entries.forEach((keyArgs, key) => {
+    entries.forEach((forgetEntry, key) => {
       const count = (this.keyRefCounts.get(key) ?? 1) - 1;
       if (count <= 0) {
         this.keyRefCounts.delete(key);
-        // Release the memoized result from optimism's LRU cache.
-        this.executeSelectionSet.forget(...keyArgs);
-
-        // Also remove the Trie routing path for this key. This frees the
-        // strong Map entries for string args (entity ref, varString) that
-        // the Trie holds permanently. removeArray prunes empty parent nodes
-        // bottom-up, so if "User:1" has no other varStrings it is also
-        // removed. supportsResultCaching narrows store to EntityStore,
-        // giving access to the CacheGroup's keyMaker Trie.
-
-        const [selectionSet, parent, ctx, canonizeResults] = keyArgs;
-        if (supportsResultCaching(ctx.store)) {
-          ctx.store.group.keyMaker.removeArray([
-            selectionSet,
-            // Matches what store.makeCacheKey passes to the Trie:
-            // a plain string when parent is a Reference, otherwise the
-            // StoreObject itself (WeakMap branch, so no issue leaving it).
-            isReference(parent) ? parent.__ref : parent,
-            ctx.varString,
-            canonizeResults,
-          ]);
-        }
+        forgetEntry();
       } else {
         this.keyRefCounts.set(key, count);
       }
