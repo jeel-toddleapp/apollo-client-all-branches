@@ -546,13 +546,20 @@ export class StoreReader {
           // In this case, because we know the field has a selection set,
           // it must be trying to query a GraphQLObjectType, which is why
           // fieldValue must be != null.
+          const execOptions: ExecSelectionSetOptions = {
+            selectionSet: selection.selectionSet,
+            objectOrReference: fieldValue as StoreObject | Reference,
+            enclosingRef: isReference(fieldValue) ? fieldValue : enclosingRef,
+            context,
+          };
           fieldValue = handleMissing(
-            this.executeSelectionSet({
-              selectionSet: selection.selectionSet,
-              objectOrReference: fieldValue as StoreObject | Reference,
-              enclosingRef: isReference(fieldValue) ? fieldValue : enclosingRef,
-              context,
-            }),
+            // Non-Reference objects (no keyFields) are embedded inline and
+            // cannot be accessed independently by ID. Skip creating a separate
+            // memoized Entry for them — their store field reads are captured as
+            // dependencies of the enclosing entity's reactive computation.
+            isReference(fieldValue) ?
+              this.executeSelectionSet(execOptions)
+            : this.execSelectionSetImpl(execOptions),
             resultName
           );
         }
@@ -636,13 +643,17 @@ export class StoreReader {
 
       // This is an object, run the selection set on it
       if (field.selectionSet) {
+        const execOptions: ExecSelectionSetOptions = {
+          selectionSet: field.selectionSet,
+          objectOrReference: item,
+          enclosingRef: isReference(item) ? item : enclosingRef,
+          context,
+        };
         return handleMissing(
-          this.executeSelectionSet({
-            selectionSet: field.selectionSet,
-            objectOrReference: item,
-            enclosingRef: isReference(item) ? item : enclosingRef,
-            context,
-          }),
+          // Same as above: only memoize for References (objects with keyFields).
+          isReference(item) ?
+            this.executeSelectionSet(execOptions)
+          : this.execSelectionSetImpl(execOptions),
           i
         );
       }

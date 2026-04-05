@@ -2340,3 +2340,352 @@ describe("StoreReader.forgetWatch", () => {
     expect(keyRefCounts.size).toBe(0);
   });
 });
+
+describe("skips memoized entries for non-keyFields objects", () => {
+  // ─── helpers ────────────────────────────────────────────────────────────────
+
+  /** Trigger a broadcast so the reader associates entries with the watch. */
+  function triggerBroadcast(
+    cache: InMemoryCache,
+    query: TypedDocumentNode<any, any>,
+    data: any,
+    variables?: Record<string, any>
+  ) {
+    cache.writeQuery({ query, data, variables });
+  }
+
+  // ─── Test 1: no entries created for inline nested object ────────────────────
+
+  it("does not create watchEntry for inline (non-keyFields) nested object", () => {
+    const query: TypedDocumentNode<any, any> = gql`
+      query {
+        user {
+          name
+          address {
+            city
+          }
+        }
+      }
+    `;
+
+    // No typePolicies → user and address have no keyFields and are stored inline
+    const cache = new InMemoryCache({ resultCaching: true });
+    const reader: StoreReader = (cache as any).storeReader;
+    const keyRefCounts: Map<object, number> = (reader as any).keyRefCounts;
+
+    cache.writeQuery({
+      query,
+      data: {
+        user: { __typename: "User", name: "Alice", address: { city: "NYC" } },
+      },
+    });
+
+    const unwatch = cache.watch({
+      query,
+      optimistic: true,
+      callback: () => {},
+      immediate: false,
+    });
+
+    // Trigger broadcast so entries are registered
+    triggerBroadcast(cache, query, {
+      user: { __typename: "User", name: "Alice", address: { city: "NYC" } },
+    });
+
+    // Each executeSelectionSet call produces 2 entries: one for the actual
+    // computation and one for the peek with !canonizeResults (line 193).
+    // With this optimisation only ROOT_QUERY calls the memoized wrapper →
+    // exactly 2 entries. Without the optimisation, user and address would
+    // each add 2 more (6 total).
+    expect(keyRefCounts.size).toBe(2);
+
+    unwatch();
+    expect(keyRefCounts.size).toBe(0);
+  });
+
+  // ─── Test 2: entries still created for Reference (keyFields) nested object ──
+
+  it("still creates watchEntry for Reference (keyFields) nested object", () => {
+    const query: TypedDocumentNode<any, any> = gql`
+      query {
+        user {
+          id
+          name
+        }
+      }
+    `;
+
+    const cache = new InMemoryCache({
+      resultCaching: true,
+      typePolicies: { User: { keyFields: ["id"] } },
+    });
+    const reader: StoreReader = (cache as any).storeReader;
+    const keyRefCounts: Map<object, number> = (reader as any).keyRefCounts;
+
+    const unwatch = cache.watch({
+      query,
+      optimistic: true,
+      callback: () => {},
+      immediate: false,
+    });
+
+    triggerBroadcast(cache, query, {
+      user: { __typename: "User", id: "1", name: "Alice" },
+    });
+
+    // ROOT_QUERY × 2 (actual + peek) + User:1 × 2 (actual + peek) = 4 entries.
+    // More than the inline-only case (2), confirming References still create entries.
+    expect(keyRefCounts.size).toBeGreaterThanOrEqual(4);
+
+    unwatch();
+    expect(keyRefCounts.size).toBe(0);
+  });
+
+  // ─── Test 3: deeply nested inline objects read correctly ────────────────────
+
+  it("reads deeply nested inline objects correctly", () => {
+    const query = gql`
+      query {
+        parent {
+          child {
+            grandchild {
+              name
+            }
+          }
+        }
+      }
+    `;
+
+    // addTypename: false to keep expected result shape clean
+    const cache = new InMemoryCache({ resultCaching: true, addTypename: false });
+    cache.writeQuery({
+      query,
+      data: {
+        parent: {
+          child: {
+            grandchild: { name: "deep" },
+          },
+        },
+      },
+    });
+
+    const result = cache.readQuery({ query });
+    expect(result).toEqual({
+      parent: {
+        child: {
+          grandchild: { name: "deep" },
+        },
+      },
+    });
+  });
+
+  // ─── Test 4: mixed inline + Reference nesting reads correctly ───────────────
+
+  it("reads mixed inline and Reference nesting correctly", () => {
+    const query = gql`
+      query {
+        author {
+          id
+          name
+          address {
+            street
+            coordinates {
+              lat
+              lng
+            }
+          }
+        }
+      }
+    `;
+
+    // addTypename: false to keep expected result shape clean
+    const cache = new InMemoryCache({
+      resultCaching: true,
+      addTypename: false,
+      typePolicies: { Author: { keyFields: ["id"] } },
+    });
+
+    cache.writeQuery({
+      query,
+      data: {
+        author: {
+          id: "a1",
+          name: "Jane",
+          address: {
+            street: "123 Main St",
+            coordinates: { lat: 40.7, lng: -74.0 },
+          },
+        },
+      },
+    });
+
+    const result = cache.readQuery({ query });
+    expect(result).toEqual({
+      author: {
+        id: "a1",
+        name: "Jane",
+        address: {
+          street: "123 Main St",
+          coordinates: { lat: 40.7, lng: -74.0 },
+        },
+      },
+    });
+  });
+
+  // ─── Test 5: reactivity preserved for inline nested objects ─────────────────
+
+  it("fires watch callback when inline nested object fields change", () => {
+    const query = gql`
+      query {
+        user {
+          name
+          address {
+            city
+          }
+        }
+      }
+    `;
+
+    const cache = new InMemoryCache({ resultCaching: true, addTypename: false });
+    cache.writeQuery({
+      query,
+      data: { user: { name: "Alice", address: { city: "NYC" } } },
+    });
+
+    const diffs: any[] = [];
+    const unwatch = cache.watch({
+      query,
+      optimistic: true,
+      immediate: true,
+      callback: (diff) => diffs.push(diff),
+    });
+
+    // Update the inline address
+    cache.writeQuery({
+      query,
+      data: { user: { name: "Alice", address: { city: "LA" } } },
+    });
+
+    expect(diffs.length).toBe(2);
+    expect(diffs[1].result).toEqual({
+      user: { name: "Alice", address: { city: "LA" } },
+    });
+
+    unwatch();
+  });
+
+  // ─── Test 6: array of inline objects reads correctly ────────────────────────
+
+  it("reads an array of inline (no-ID) objects correctly", () => {
+    const query = gql`
+      query {
+        items {
+          name
+          value
+        }
+      }
+    `;
+
+    const cache = new InMemoryCache({ resultCaching: true, addTypename: false });
+    cache.writeQuery({
+      query,
+      data: {
+        items: [
+          { name: "a", value: 1 },
+          { name: "b", value: 2 },
+        ],
+      },
+    });
+
+    const result = cache.readQuery({ query });
+    expect(result).toEqual({
+      items: [
+        { name: "a", value: 1 },
+        { name: "b", value: 2 },
+      ],
+    });
+  });
+
+  // ─── Test 7: array of References still creates entries ──────────────────────
+
+  it("still creates watchEntries for Reference items inside arrays", () => {
+    const query = gql`
+      query {
+        items {
+          id
+          name
+        }
+      }
+    `;
+
+    const cache = new InMemoryCache({
+      resultCaching: true,
+      typePolicies: { Item: { keyFields: ["id"] } },
+    });
+    const reader: StoreReader = (cache as any).storeReader;
+    const keyRefCounts: Map<object, number> = (reader as any).keyRefCounts;
+
+    const unwatch = cache.watch({
+      query,
+      optimistic: true,
+      callback: () => {},
+      immediate: false,
+    });
+
+    triggerBroadcast(cache, query, {
+      items: [
+        { __typename: "Item", id: "1", name: "a" },
+        { __typename: "Item", id: "2", name: "b" },
+      ],
+    });
+
+    // ROOT_QUERY×2 + executeSubSelectedArray×1 + Item:1×2 + Item:2×2 = 7 entries.
+    // More than the inline-only case (2), confirming Reference arrays still track entries.
+    expect(keyRefCounts.size).toBeGreaterThanOrEqual(7);
+
+    unwatch();
+    expect(keyRefCounts.size).toBe(0);
+  });
+
+  // ─── Test 8: reactivity for inline objects inside arrays ────────────────────
+
+  it("fires watch callback when inline objects inside an array change", () => {
+    const query = gql`
+      query {
+        items {
+          name
+        }
+      }
+    `;
+
+    const cache = new InMemoryCache({ resultCaching: true, addTypename: false });
+    cache.writeQuery({
+      query,
+      data: {
+        items: [{ name: "a" }, { name: "b" }],
+      },
+    });
+
+    const diffs: any[] = [];
+    const unwatch = cache.watch({
+      query,
+      optimistic: true,
+      immediate: true,
+      callback: (diff) => diffs.push(diff),
+    });
+
+    cache.writeQuery({
+      query,
+      data: {
+        items: [{ name: "a" }, { name: "changed" }],
+      },
+    });
+
+    expect(diffs.length).toBe(2);
+    expect(diffs[1].result).toEqual({
+      items: [{ name: "a" }, { name: "changed" }],
+    });
+
+    unwatch();
+  });
+});
