@@ -4025,3 +4025,901 @@ describe("writing to the store", () => {
     `);
   });
 });
+
+describe("auto deep merge for non-normalized objects", () => {
+  it("merges different fields on same non-normalized nested object", () => {
+    const cache = new InMemoryCache({
+      typePolicies: {
+        Book: { keyFields: ["isbn"] },
+      },
+    });
+
+    const queryWithName = gql`
+      query {
+        currentlyReading {
+          isbn
+          title
+          author {
+            name
+          }
+        }
+      }
+    `;
+
+    const queryWithAge = gql`
+      query {
+        currentlyReading {
+          isbn
+          author {
+            age
+          }
+        }
+      }
+    `;
+
+    cache.writeQuery({
+      query: queryWithName,
+      data: {
+        currentlyReading: {
+          __typename: "Book",
+          isbn: "123",
+          title: "Foo",
+          author: {
+            __typename: "Author",
+            name: "Alice",
+          },
+        },
+      },
+    });
+
+    cache.writeQuery({
+      query: queryWithAge,
+      data: {
+        currentlyReading: {
+          __typename: "Book",
+          isbn: "123",
+          author: {
+            __typename: "Author",
+            age: 30,
+          },
+        },
+      },
+    });
+
+    const extracted = cache.extract();
+    expect(extracted['Book:{"isbn":"123"}']!.author).toEqual({
+      __typename: "Author",
+      name: "Alice",
+      age: 30,
+    });
+  });
+
+  it("merges deeply nested objects (3+ levels deep)", () => {
+    const cache = new InMemoryCache();
+
+    const query1 = gql`
+      query {
+        user {
+          id
+          profile {
+            name
+            address {
+              city
+              geo {
+                lat
+              }
+            }
+          }
+        }
+      }
+    `;
+
+    const query2 = gql`
+      query {
+        user {
+          id
+          profile {
+            bio
+            address {
+              zip
+              geo {
+                lng
+              }
+            }
+          }
+        }
+      }
+    `;
+
+    cache.writeQuery({
+      query: query1,
+      data: {
+        user: {
+          __typename: "User",
+          id: "1",
+          profile: {
+            __typename: "Profile",
+            name: "Jeel",
+            address: {
+              __typename: "Address",
+              city: "NYC",
+              geo: { __typename: "Geo", lat: 40.7 },
+            },
+          },
+        },
+      },
+    });
+
+    cache.writeQuery({
+      query: query2,
+      data: {
+        user: {
+          __typename: "User",
+          id: "1",
+          profile: {
+            __typename: "Profile",
+            bio: "Dev",
+            address: {
+              __typename: "Address",
+              zip: "10001",
+              geo: { __typename: "Geo", lng: -74.0 },
+            },
+          },
+        },
+      },
+    });
+
+    const extracted = cache.extract();
+    const user = extracted["User:1"]!;
+    expect(user.profile).toEqual({
+      __typename: "Profile",
+      name: "Jeel",
+      bio: "Dev",
+      address: {
+        __typename: "Address",
+        city: "NYC",
+        zip: "10001",
+        geo: { __typename: "Geo", lat: 40.7, lng: -74.0 },
+      },
+    });
+  });
+
+  it("merges array of non-normalized objects by index", () => {
+    const cache = new InMemoryCache();
+
+    const query1 = gql`
+      query {
+        user {
+          id
+          tags {
+            label
+            color
+          }
+        }
+      }
+    `;
+
+    const query2 = gql`
+      query {
+        user {
+          id
+          tags {
+            label
+            priority
+          }
+        }
+      }
+    `;
+
+    cache.writeQuery({
+      query: query1,
+      data: {
+        user: {
+          __typename: "User",
+          id: "1",
+          tags: [
+            { __typename: "Tag", label: "js", color: "yellow" },
+            { __typename: "Tag", label: "ts", color: "blue" },
+          ],
+        },
+      },
+    });
+
+    cache.writeQuery({
+      query: query2,
+      data: {
+        user: {
+          __typename: "User",
+          id: "1",
+          tags: [
+            { __typename: "Tag", label: "js", priority: 1 },
+            { __typename: "Tag", label: "ts", priority: 2 },
+          ],
+        },
+      },
+    });
+
+    const extracted = cache.extract();
+    const user = extracted["User:1"]!;
+    expect(user.tags).toEqual([
+      { __typename: "Tag", label: "js", color: "yellow", priority: 1 },
+      { __typename: "Tag", label: "ts", color: "blue", priority: 2 },
+    ]);
+  });
+
+  it("merges deeply nested objects within array elements", () => {
+    const cache = new InMemoryCache();
+
+    const query1 = gql`
+      query {
+        user {
+          id
+          friends {
+            name
+            profile {
+              avatar
+            }
+          }
+        }
+      }
+    `;
+
+    const query2 = gql`
+      query {
+        user {
+          id
+          friends {
+            name
+            profile {
+              bio
+            }
+          }
+        }
+      }
+    `;
+
+    cache.writeQuery({
+      query: query1,
+      data: {
+        user: {
+          __typename: "User",
+          id: "1",
+          friends: [
+            {
+              __typename: "Friend",
+              name: "Alice",
+              profile: { __typename: "Profile", avatar: "a.jpg" },
+            },
+          ],
+        },
+      },
+    });
+
+    cache.writeQuery({
+      query: query2,
+      data: {
+        user: {
+          __typename: "User",
+          id: "1",
+          friends: [
+            {
+              __typename: "Friend",
+              name: "Alice",
+              profile: { __typename: "Profile", bio: "Dev" },
+            },
+          ],
+        },
+      },
+    });
+
+    const extracted = cache.extract();
+    const user = extracted["User:1"]!;
+    expect((user.friends as any[])[0]).toEqual({
+      __typename: "Friend",
+      name: "Alice",
+      profile: { __typename: "Profile", avatar: "a.jpg", bio: "Dev" },
+    });
+  });
+
+  it("truncates to incoming array length when incoming is shorter", () => {
+    const cache = new InMemoryCache();
+
+    const query1 = gql`
+      query {
+        user {
+          id
+          tags {
+            label
+            color
+          }
+        }
+      }
+    `;
+
+    const query2 = gql`
+      query {
+        user {
+          id
+          tags {
+            label
+            priority
+          }
+        }
+      }
+    `;
+
+    cache.writeQuery({
+      query: query1,
+      data: {
+        user: {
+          __typename: "User",
+          id: "1",
+          tags: [
+            { __typename: "Tag", label: "js", color: "yellow" },
+            { __typename: "Tag", label: "ts", color: "blue" },
+            { __typename: "Tag", label: "go", color: "cyan" },
+          ],
+        },
+      },
+    });
+
+    cache.writeQuery({
+      query: query2,
+      data: {
+        user: {
+          __typename: "User",
+          id: "1",
+          tags: [
+            { __typename: "Tag", label: "js", priority: 1 },
+            { __typename: "Tag", label: "ts", priority: 2 },
+          ],
+        },
+      },
+    });
+
+    const extracted = cache.extract();
+    const tags = extracted["User:1"]!.tags as any[];
+    expect(tags).toHaveLength(2);
+    expect(tags[0]).toEqual({
+      __typename: "Tag",
+      label: "js",
+      color: "yellow",
+      priority: 1,
+    });
+    expect(tags[1]).toEqual({
+      __typename: "Tag",
+      label: "ts",
+      color: "blue",
+      priority: 2,
+    });
+  });
+
+  it("respects explicit merge: false override", () => {
+    const cache = new InMemoryCache({
+      typePolicies: {
+        Book: {
+          keyFields: ["isbn"],
+          fields: {
+            author: { merge: false },
+          },
+        },
+      },
+    });
+
+    const query1 = gql`
+      query {
+        book {
+          isbn
+          author {
+            name
+            age
+          }
+        }
+      }
+    `;
+
+    const query2 = gql`
+      query {
+        book {
+          isbn
+          author {
+            name
+          }
+        }
+      }
+    `;
+
+    cache.writeQuery({
+      query: query1,
+      data: {
+        book: {
+          __typename: "Book",
+          isbn: "123",
+          author: { __typename: "Author", name: "Alice", age: 30 },
+        },
+      },
+    });
+
+    cache.writeQuery({
+      query: query2,
+      data: {
+        book: {
+          __typename: "Book",
+          isbn: "123",
+          author: { __typename: "Author", name: "Alice" },
+        },
+      },
+    });
+
+    const extracted = cache.extract();
+    expect(extracted['Book:{"isbn":"123"}']!.author).toEqual({
+      __typename: "Author",
+      name: "Alice",
+    });
+  });
+
+  it("replaces nested object with null", () => {
+    const cache = new InMemoryCache();
+
+    const query1 = gql`
+      query {
+        user {
+          id
+          profile {
+            name
+          }
+        }
+      }
+    `;
+
+    const query2 = gql`
+      query {
+        user {
+          id
+          profile {
+            name
+          }
+        }
+      }
+    `;
+
+    cache.writeQuery({
+      query: query1,
+      data: {
+        user: {
+          __typename: "User",
+          id: "1",
+          profile: { __typename: "Profile", name: "Jeel" },
+        },
+      },
+    });
+
+    cache.writeQuery({
+      query: query2,
+      data: {
+        user: {
+          __typename: "User",
+          id: "1",
+          profile: null,
+        },
+      },
+    });
+
+    const extracted = cache.extract();
+    expect(extracted["User:1"]!.profile).toBeNull();
+  });
+
+  it("does not affect normalized objects with IDs", () => {
+    const cache = new InMemoryCache();
+
+    const query1 = gql`
+      query {
+        user {
+          id
+          organization {
+            id
+            name
+          }
+        }
+      }
+    `;
+
+    const query2 = gql`
+      query {
+        user {
+          id
+          organization {
+            id
+            location
+          }
+        }
+      }
+    `;
+
+    cache.writeQuery({
+      query: query1,
+      data: {
+        user: {
+          __typename: "User",
+          id: "1",
+          organization: { __typename: "Org", id: "o1", name: "Acme" },
+        },
+      },
+    });
+
+    cache.writeQuery({
+      query: query2,
+      data: {
+        user: {
+          __typename: "User",
+          id: "1",
+          organization: { __typename: "Org", id: "o1", location: "NYC" },
+        },
+      },
+    });
+
+    const extracted = cache.extract();
+    // Organization is stored as a Reference, not inline
+    expect(extracted["User:1"]!.organization).toEqual(
+      makeReference("Org:o1")
+    );
+    // And merged via EntityStore
+    expect(extracted["Org:o1"]).toEqual({
+      __typename: "Org",
+      id: "o1",
+      name: "Acme",
+      location: "NYC",
+    });
+  });
+
+  it("handles mixed array of normalized and non-normalized objects", () => {
+    const cache = new InMemoryCache();
+
+    const query1 = gql`
+      query {
+        user {
+          id
+          contacts {
+            ... on Friend {
+              id
+              name
+              mood
+            }
+            ... on AnonTip {
+              message
+              source
+            }
+          }
+        }
+      }
+    `;
+
+    const query2 = gql`
+      query {
+        user {
+          id
+          contacts {
+            ... on Friend {
+              id
+              name
+              status
+            }
+            ... on AnonTip {
+              message
+              priority
+            }
+          }
+        }
+      }
+    `;
+
+    cache.writeQuery({
+      query: query1,
+      data: {
+        user: {
+          __typename: "User",
+          id: "1",
+          contacts: [
+            { __typename: "Friend", id: "f1", name: "Bob", mood: "happy" },
+            { __typename: "AnonTip", message: "hi", source: "web" },
+          ],
+        },
+      },
+    });
+
+    cache.writeQuery({
+      query: query2,
+      data: {
+        user: {
+          __typename: "User",
+          id: "1",
+          contacts: [
+            { __typename: "Friend", id: "f1", name: "Bob", status: "online" },
+            { __typename: "AnonTip", message: "hi", priority: 1 },
+          ],
+        },
+      },
+    });
+
+    const extracted = cache.extract();
+    const contacts = extracted["User:1"]!.contacts as any[];
+    // Friend is normalized (has ID) → stored as Reference
+    expect(contacts[0]).toEqual(makeReference("Friend:f1"));
+    expect(extracted["Friend:f1"]).toEqual({
+      __typename: "Friend",
+      id: "f1",
+      name: "Bob",
+      mood: "happy",
+      status: "online",
+    });
+    // AnonTip is non-normalized → inline merged
+    expect(contacts[1]).toEqual({
+      __typename: "AnonTip",
+      message: "hi",
+      source: "web",
+      priority: 1,
+    });
+  });
+
+  it("field-level custom merge on object field takes priority over auto-merge", () => {
+    const cache = new InMemoryCache({
+      typePolicies: {
+        Book: {
+          keyFields: ["isbn"],
+          fields: {
+            author: {
+              merge(existing, incoming) {
+                return { ...incoming, customMerged: true };
+              },
+            },
+          },
+        },
+      },
+    });
+
+    const query1 = gql`
+      query {
+        book {
+          isbn
+          author {
+            name
+            age
+          }
+        }
+      }
+    `;
+
+    const query2 = gql`
+      query {
+        book {
+          isbn
+          author {
+            name
+          }
+        }
+      }
+    `;
+
+    cache.writeQuery({
+      query: query1,
+      data: {
+        book: {
+          __typename: "Book",
+          isbn: "123",
+          author: { __typename: "Author", name: "Alice", age: 30 },
+        },
+      },
+    });
+
+    cache.writeQuery({
+      query: query2,
+      data: {
+        book: {
+          __typename: "Book",
+          isbn: "123",
+          author: { __typename: "Author", name: "Alice" },
+        },
+      },
+    });
+
+    const extracted = cache.extract();
+    // Custom merge runs, not auto-merge — age is NOT preserved
+    expect(extracted['Book:{"isbn":"123"}']!.author).toEqual({
+      __typename: "Author",
+      name: "Alice",
+      customMerged: true,
+    });
+  });
+
+  it("type-level merge:true on non-normalized type preserves fields like auto-merge", () => {
+    const cache = new InMemoryCache({
+      typePolicies: {
+        Book: { keyFields: ["isbn"] },
+        Author: { merge: true },
+      },
+    });
+
+    const query1 = gql`
+      query {
+        book {
+          isbn
+          author {
+            name
+            age
+          }
+        }
+      }
+    `;
+
+    const query2 = gql`
+      query {
+        book {
+          isbn
+          author {
+            name
+          }
+        }
+      }
+    `;
+
+    cache.writeQuery({
+      query: query1,
+      data: {
+        book: {
+          __typename: "Book",
+          isbn: "123",
+          author: { __typename: "Author", name: "Alice", age: 30 },
+        },
+      },
+    });
+
+    cache.writeQuery({
+      query: query2,
+      data: {
+        book: {
+          __typename: "Book",
+          isbn: "123",
+          author: { __typename: "Author", name: "Alice" },
+        },
+      },
+    });
+
+    const extracted = cache.extract();
+    // Type-level merge:true preserves age from write 1
+    expect(extracted['Book:{"isbn":"123"}']!.author).toEqual({
+      __typename: "Author",
+      name: "Alice",
+      age: 30,
+    });
+  });
+
+  it("type-level merge:false on non-normalized type overrides auto-merge", () => {
+    const cache = new InMemoryCache({
+      typePolicies: {
+        Book: { keyFields: ["isbn"] },
+        Author: { merge: false },
+      },
+    });
+
+    const query1 = gql`
+      query {
+        book {
+          isbn
+          author {
+            name
+            age
+          }
+        }
+      }
+    `;
+
+    const query2 = gql`
+      query {
+        book {
+          isbn
+          author {
+            name
+          }
+        }
+      }
+    `;
+
+    cache.writeQuery({
+      query: query1,
+      data: {
+        book: {
+          __typename: "Book",
+          isbn: "123",
+          author: { __typename: "Author", name: "Alice", age: 30 },
+        },
+      },
+    });
+
+    cache.writeQuery({
+      query: query2,
+      data: {
+        book: {
+          __typename: "Book",
+          isbn: "123",
+          author: { __typename: "Author", name: "Alice" },
+        },
+      },
+    });
+
+    const extracted = cache.extract();
+    // merge:false overrides auto-merge — age is NOT preserved
+    expect(extracted['Book:{"isbn":"123"}']!.author).toEqual({
+      __typename: "Author",
+      name: "Alice",
+    });
+  });
+
+  it("field-level custom merge on array field takes priority over element auto-merge", () => {
+    const cache = new InMemoryCache({
+      typePolicies: {
+        User: {
+          fields: {
+            tags: {
+              merge(existing: any[] = [], incoming: any[]) {
+                return [...existing, ...incoming];
+              },
+            },
+          },
+        },
+      },
+    });
+
+    const query1 = gql`
+      query {
+        user {
+          id
+          tags {
+            label
+            color
+          }
+        }
+      }
+    `;
+
+    const query2 = gql`
+      query {
+        user {
+          id
+          tags {
+            label
+            priority
+          }
+        }
+      }
+    `;
+
+    cache.writeQuery({
+      query: query1,
+      data: {
+        user: {
+          __typename: "User",
+          id: "1",
+          tags: [{ __typename: "Tag", label: "js", color: "yellow" }],
+        },
+      },
+    });
+
+    cache.writeQuery({
+      query: query2,
+      data: {
+        user: {
+          __typename: "User",
+          id: "1",
+          tags: [{ __typename: "Tag", label: "ts", priority: 1 }],
+        },
+      },
+    });
+
+    const extracted = cache.extract();
+    const tags = extracted["User:1"]!.tags as any[];
+    // Custom concat merge — both elements present, NOT merged by index
+    expect(tags).toHaveLength(2);
+    expect(tags[0]).toEqual({ __typename: "Tag", label: "js", color: "yellow" });
+    expect(tags[1]).toEqual({ __typename: "Tag", label: "ts", priority: 1 });
+  });
+});

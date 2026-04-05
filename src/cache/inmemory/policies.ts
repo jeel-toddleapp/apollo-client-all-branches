@@ -269,7 +269,7 @@ const simpleKeyArgsFn: KeyArgsFunction = (_args, context) => context.fieldName;
 
 // These merge functions can be selected by specifying merge:true or
 // merge:false in a field policy.
-const mergeTrueFn: FieldMergeFunction<any> = (
+export const mergeTrueFn: FieldMergeFunction<any> = (
   existing,
   incoming,
   { mergeObjects }

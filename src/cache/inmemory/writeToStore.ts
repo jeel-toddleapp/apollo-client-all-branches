@@ -45,7 +45,7 @@ import type { StoreReader } from "./readFromStore.js";
 import type { InMemoryCache } from "./inMemoryCache.js";
 import type { EntityStore } from "./entityStore.js";
 import type { Cache } from "../../core/index.js";
-import { normalizeReadFieldOptions } from "./policies.js";
+import { normalizeReadFieldOptions, mergeTrueFn } from "./policies.js";
 import type { ReadFieldFunction } from "../core/types/common.js";
 
 export interface WriteContext extends ReadMergeModifyContext {
@@ -363,6 +363,27 @@ export class StoreWriter {
             typename,
             merge,
           };
+        } else if (
+          field.selectionSet &&
+          storeValueIsStoreObject(incomingValue)
+        ) {
+          // Non-normalized, non-ref object → auto deep merge
+          childTree.info = {
+            field,
+            typename,
+            merge: mergeTrueFn,
+          };
+        } else if (field.selectionSet && isArray(incomingValue)) {
+          // Array of objects without explicit merge — set element-level
+          // merge so non-normalized StoreObject elements are deep merged.
+          // Recurse into nested arrays (multidimensional) to find the
+          // actual StoreObject elements at any depth.
+          setAutoMergeOnArrayElements(
+            childTree,
+            incomingValue as readonly StoreValue[],
+            field,
+            typename
+          );
         } else {
           maybeRecycleChildMergeTree(mergeTree, storeFieldName);
         }
@@ -629,10 +650,7 @@ export class StoreWriter {
     getStorageArgs?: Parameters<EntityStore["getStorage"]>
   ): T | Reference {
     if (mergeTree.map.size && !isReference(incoming)) {
-      const e: StoreObject | Reference | undefined =
-        // Items in the same position in different arrays are not
-        // necessarily related to each other, so when incoming is an array
-        // we process its elements as if there was no existing data.
+      const e: StoreObject | Reference | readonly StoreValue[] | undefined =
         (
           !isArray(incoming) &&
           // Likewise, existing must be either a Reference or a StoreObject
@@ -641,6 +659,7 @@ export class StoreWriter {
           (isReference(existing) || storeValueIsStoreObject(existing))
         ) ?
           existing
+        : isArray(incoming) && isArray(existing) ? existing
         : void 0;
 
       // This narrowing is implied by mergeTree.map.size > 0 and
@@ -652,7 +671,7 @@ export class StoreWriter {
       // are derived from the identity of the parent object plus a
       // sequence of storeFieldName strings/numbers identifying the nested
       // field name path of each field value to be merged.
-      if (e && !getStorageArgs) {
+      if (e && !isArray(e) && !getStorageArgs) {
         getStorageArgs = [isReference(e) ? e.__ref : e];
       }
 
@@ -787,6 +806,34 @@ function maybeRecycleChildMergeTree({ map }: MergeTree, name: string | number) {
     emptyMergeTreePool.push(childTree);
     map.delete(name);
   }
+}
+
+// Recursively set mergeTrueFn on StoreObject elements within arrays,
+// handling multidimensional arrays by recursing through nested array levels.
+// Iterate values directly, creating child trees as needed, to set
+// mergeTrueFn on non-normalized StoreObject elements. Recurses through
+// nested arrays (multidimensional) to find the actual objects at any depth.
+function setAutoMergeOnArrayElements(
+  tree: MergeTree,
+  values: readonly StoreValue[],
+  field: FieldNode,
+  typename: string | undefined
+) {
+  values.forEach((val, i) => {
+    if (storeValueIsStoreObject(val)) {
+      const elementTree = getChildMergeTree(tree, i);
+      if (!elementTree.info) {
+        elementTree.info = { field, typename, merge: mergeTrueFn };
+      }
+    } else if (isArray(val)) {
+      setAutoMergeOnArrayElements(
+        getChildMergeTree(tree, i),
+        val,
+        field,
+        typename
+      );
+    }
+  });
 }
 
 const warnings = new Set<string>();
